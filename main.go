@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -12,26 +13,27 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-func main() {
+var (
+	currentCmd         *exec.Cmd
+	scriptCrashed      bool
+	scriptCrashedMutex sync.Mutex
+)
 
+func main() {
 	if len(os.Args) < 3 {
 		log.Fatal("Please provide a file to watch & runner")
 	}
 	runner := os.Args[1]
 	scriptTorun := os.Args[2]
 	watchDir := filepath.Dir(scriptTorun)
-
 	watcher, err := fsnotify.NewWatcher()
-
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer watcher.Close()
-
 	done := make(chan bool)
 	go watchForChanges(watcher, scriptTorun, runner)
 	err = watcher.Add(watchDir)
-
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -39,12 +41,9 @@ func main() {
 	<-done
 }
 
-var currentCmd *exec.Cmd
-
 func watchForChanges(watcher *fsnotify.Watcher, scriptToRun string, runner string) {
 	var timer *time.Timer
 	debounceDelay := 100 * time.Millisecond
-
 	for {
 		select {
 		case event, ok := <-watcher.Events:
@@ -56,8 +55,17 @@ func watchForChanges(watcher *fsnotify.Watcher, scriptToRun string, runner strin
 					timer.Stop()
 				}
 				timer = time.AfterFunc(debounceDelay, func() {
-					color.Green("\nChanges Detected. Restarting script...\n")
-					startScript(scriptToRun, runner, true)
+					scriptCrashedMutex.Lock()
+					crashed := scriptCrashed
+					scriptCrashedMutex.Unlock()
+
+					if crashed {
+						color.Yellow("\nScript was crashed. Restarting due to changes...")
+						startScript(scriptToRun, runner, true)
+					} else {
+						color.Green("\nChanges Detected. Restarting script...\n")
+						startScript(scriptToRun, runner, true)
+					}
 				})
 			}
 		case err, ok := <-watcher.Errors:
@@ -77,27 +85,36 @@ func startScript(scriptTorun string, runner string, restart bool) {
 		}
 		time.Sleep(time.Second)
 	}
+
 	if !restart {
 		color.Blue("\n[ GOMON ] Directory Watcher Added %s", scriptTorun)
 		color.Blue("[ GOMON ] Restart Added %s", scriptTorun)
 		color.Blue("[ GOMON ] Starting script %s\n", scriptTorun)
-
 	}
+
 	currentCmd = exec.Command(runner, scriptTorun)
 	currentCmd.Stdout = os.Stdout
 	currentCmd.Stderr = os.Stderr
+	currentCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	err := currentCmd.Start()
 	if err != nil {
 		log.Fatal(err)
 		return
 	}
+
+	scriptCrashedMutex.Lock()
+	scriptCrashed = false
+	scriptCrashedMutex.Unlock()
+
 	go func() {
 		err := currentCmd.Wait()
 		if err != nil {
 			color.Red("\nScript exited with error: %v\n", err)
-			time.Sleep(time.Second) // Wait a bit before restarting
-			startScript(scriptTorun, runner, false)
+			color.Yellow("[ GOMON ] Waiting for file changes before restarting...")
+			scriptCrashedMutex.Lock()
+			scriptCrashed = true
+			scriptCrashedMutex.Unlock()
 		}
 	}()
 }
